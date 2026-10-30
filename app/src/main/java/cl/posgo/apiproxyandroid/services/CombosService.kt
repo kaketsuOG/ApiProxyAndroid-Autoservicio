@@ -257,6 +257,58 @@ class CombosService(private val context: Context) {
         }
     }
 
+    fun getProductComboGroups(productId: Int, forceRefresh: Boolean = false): Map<String, Any> {
+        return try {
+            if (!forceRefresh) {
+                val cached = database.getComboGroupsFromCache(productId)
+                if (cached != null) {
+                    logger.info("Combo groups de producto $productId obtenidos desde caché")
+                    return cached
+                }
+            }
+
+            logger.info("Consultando combo groups de producto $productId desde Odoo...")
+            val connection = openSslConnection("${getOdooUrl()}/get_product_combo_groups")
+            connection.apply {
+                requestMethod = "POST"
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                connectTimeout = 15000
+                readTimeout = 15000
+            }
+
+            val writer = OutputStreamWriter(connection.outputStream)
+            writer.write(gson.toJson(mapOf("product_id" to productId)))
+            writer.flush()
+            writer.close()
+
+            val responseCode = connection.responseCode
+            val responseBody = if (responseCode == 200) {
+                connection.inputStream.bufferedReader().use { it.readText() }
+            } else {
+                connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+            }
+            connection.disconnect()
+
+            if (responseCode == 200) {
+                val type = object : TypeToken<Map<String, Any>>() {}.type
+                val result: Map<String, Any> = gson.fromJson(responseBody, type)
+                if (result["success"] == true) {
+                    val hasCombos = result["has_combos"] == true
+                    val comboGroups = result["combo_groups"] as? List<*> ?: emptyList<Any>()
+                    database.saveComboGroupsCache(productId, hasCombos, comboGroups)
+                }
+                logger.info("Combo groups de producto $productId obtenidos desde Odoo")
+                result
+            } else {
+                mapOf("success" to false, "error" to "HTTP $responseCode: $responseBody")
+            }
+        } catch (e: Exception) {
+            logger.error("Error consultando combo groups: ${e.message}")
+            mapOf("success" to false, "error" to e.message.orEmpty())
+        }
+    }
+
     fun getProductBanner(productId: Int, forceRefresh: Boolean = false): Map<String, Any> {
         return try {
             if (!forceRefresh) {

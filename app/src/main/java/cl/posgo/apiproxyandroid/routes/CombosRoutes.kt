@@ -104,6 +104,37 @@ class CombosRoutes(private val context: Context) {
         }
     }
 
+    fun handleGetProductComboGroups(session: NanoHTTPD.IHTTPSession, productId: String): NanoHTTPD.Response {
+        return try {
+            val productIdInt = productId.toIntOrNull() ?: return newJsonResponse(
+                NanoHTTPD.Response.Status.BAD_REQUEST,
+                mapOf("success" to false, "error" to "product_id debe ser un número")
+            )
+            val forceRefresh = session.parameters["refresh"]?.firstOrNull()?.toBoolean() ?: false
+
+            logger.info("GET /api/products/$productId/combo-groups - refresh=$forceRefresh")
+
+            val result = combosService.getProductComboGroups(productIdInt, forceRefresh)
+
+            if (result["success"] == true) {
+                newJsonResponse(NanoHTTPD.Response.Status.OK, result)
+            } else {
+                val status = if (result["error"]?.toString()?.contains("no encontrado") == true) {
+                    NanoHTTPD.Response.Status.NOT_FOUND
+                } else {
+                    NanoHTTPD.Response.Status.INTERNAL_ERROR
+                }
+                newJsonResponse(status, result)
+            }
+        } catch (e: Exception) {
+            logger.error("Error en /api/products/$productId/combo-groups: ${e.message}")
+            newJsonResponse(
+                NanoHTTPD.Response.Status.INTERNAL_ERROR,
+                mapOf("success" to false, "error" to "Error interno: ${e.message}")
+            )
+        }
+    }
+
     fun handleGetProductSuggestions(session: NanoHTTPD.IHTTPSession, productId: String): NanoHTTPD.Response {
         return try {
             val params = session.parameters
@@ -168,12 +199,8 @@ class CombosRoutes(private val context: Context) {
             if (result["success"] == true) {
                 newJsonResponse(NanoHTTPD.Response.Status.OK, result)
             } else {
-                val status = if (result["error"]?.toString()?.contains("no disponible") == true) {
-                    NanoHTTPD.Response.Status.NOT_FOUND
-                } else {
-                    NanoHTTPD.Response.Status.INTERNAL_ERROR
-                }
-                newJsonResponse(status, result)
+                // Siempre 200 cuando no hay banner — evita logs de error en el browser
+                newJsonResponse(NanoHTTPD.Response.Status.OK, mapOf("success" to false, "banner" to null))
             }
         } catch (e: Exception) {
             logger.error("Error en /api/products/$productId/banner: ${e.message}")

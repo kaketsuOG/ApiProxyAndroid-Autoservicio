@@ -20,6 +20,7 @@ class ApiService : Service() {
 
     private var apiServer: ApiServer? = null
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
+    private val starting = java.util.concurrent.atomic.AtomicBoolean(false)
 
     companion object {
         private const val NOTIFICATION_ID = 1001
@@ -38,6 +39,8 @@ class ApiService : Service() {
             val intent = Intent(context, ApiService::class.java)
             context.stopService(intent)
         }
+
+        fun getLogger() = ApiServer.instance?.logger
     }
 
     override fun onCreate() {
@@ -49,11 +52,16 @@ class ApiService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, createNotification("Iniciando..."))
 
-        serviceScope.launch {
-            try {
-                initializeService()
-            } catch (e: Exception) {
-                updateNotification("Error: ${e.message}", isError = true)
+        // Evita que dos arranques simultáneos intenten enlazar el puerto a la vez.
+        if (starting.compareAndSet(false, true)) {
+            serviceScope.launch {
+                try {
+                    initializeService()
+                } catch (e: Exception) {
+                    updateNotification("Error: ${e.message}", isError = true)
+                } finally {
+                    starting.set(false)
+                }
             }
         }
 
@@ -69,9 +77,14 @@ class ApiService : Service() {
 
     private suspend fun initializeService() {
         try {
+            // Detener cualquier servidor anterior (local o el global) para liberar el puerto 9000.
+            try { apiServer?.stopServer() } catch (_: Exception) {}
+            try { ApiServer.instance?.stopServer() } catch (_: Exception) {}
+            apiServer = null
+
             updateNotification("Iniciando servidor...")
 
-            delay(500)
+            delay(800)
 
             apiServer = ApiServer(applicationContext, 9000)
             apiServer?.startServer()

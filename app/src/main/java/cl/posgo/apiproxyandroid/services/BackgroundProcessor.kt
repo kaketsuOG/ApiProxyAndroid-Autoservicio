@@ -4,6 +4,7 @@ import android.content.Context
 import cl.posgo.apiproxyandroid.ConfigManager
 import cl.posgo.apiproxyandroid.database.DatabaseManager
 import cl.posgo.apiproxyandroid.database.Transaction
+import cl.posgo.apiproxyandroid.utils.Fechas
 import cl.posgo.apiproxyandroid.utils.HttpClient
 import com.google.gson.Gson
 import kotlinx.coroutines.*
@@ -134,21 +135,28 @@ class BackgroundProcessor(
 
             logger.info("═══════════════════════════════════════════════════════════")
         } else {
-            dteResponse = generateDTE(transactionData, transaction)
+            // Si el DTE ya fue generado inline por AutoservicioRoutes, reutilizarlo
+            if (!transaction.dteResponse.isNullOrEmpty()) {
+                logger.info("DTE ya generado inline - Folio: ${transaction.folioDte} - reutilizando sin regenerar")
+                @Suppress("UNCHECKED_CAST")
+                dteResponse = gson.fromJson(transaction.dteResponse, Map::class.java) as Map<String, Any>
+            } else {
+                dteResponse = generateDTE(transactionData, transaction)
 
-            if (dteResponse == null) {
-                logger.error("Error generando DTE para transacción ${transaction.id}")
-                database.markAsFailed(transaction.id.toInt(), "Error generando DTE")
-                return
+                if (dteResponse == null) {
+                    logger.error("Error generando DTE para transacción ${transaction.id}")
+                    database.markAsFailed(transaction.id.toInt(), "Error generando DTE")
+                    return
+                }
+
+                logger.success("DTE generado - Folio: ${dteResponse["folio"]}")
+
+                database.saveDTEResponse(
+                    transactionId = transaction.id.toInt(),
+                    folio = (dteResponse["folio"] as? Number)?.toLong()?.toString() ?: dteResponse["folio"].toString(),
+                    dteResponse = dteResponse
+                )
             }
-
-            logger.success("DTE generado - Folio: ${dteResponse["folio"]}")
-
-            database.saveDTEResponse(
-                transactionId = transaction.id.toInt(),
-                folio = dteResponse["folio"].toString(),
-                dteResponse = dteResponse
-            )
         }
 
         val odooResponse = sendToOdoo(transactionData, dteResponse, transaction, isVoucher, voucherNumber)
@@ -170,9 +178,14 @@ class BackgroundProcessor(
         }
     }
 
+    // created_at de la cola = instante de la venta (epoch en segundos, sin zona horaria).
+    private fun saleMillisOf(transaction: Transaction): Long? =
+        transaction.createdAt.takeIf { it > 0 }?.let { it * 1000 }
+
     private fun buildDTEData(
         transactionData: Map<*, *>,
-        sessionData: Map<*, *>
+        sessionData: Map<*, *>,
+        saleMillis: Long? = null
     ): HashMap<String, Any> {
         val orders = transactionData["orders"] as? List<*> ?: emptyList<Any>()
         val firstOrder = orders.firstOrNull() as? Map<*, *> ?: emptyMap<Any?, Any?>()
@@ -189,8 +202,9 @@ class BackgroundProcessor(
 
         val companyData = sessionData["company_data"] as? Map<*, *>
 
-        val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
-        val currentDate = dateFormat.format(Date())
+        // Fecha Chile del momento de la VENTA (no de cuando la cola genera el DTE) y con zona
+        // explícita (antes tomaba la del equipo: en UTC, desde las 21:00 salía el día siguiente).
+        val currentDate = Fechas.fechaChile(saleMillis ?: System.currentTimeMillis())
 
         val detalleItems = products.mapIndexed { index, product ->
             val p = product as Map<*, *>
@@ -250,8 +264,12 @@ class BackgroundProcessor(
             "Totales" to totales
         )
 
+        val paymentMethodType = (firstOrder["payment"] as? List<*>)
+            ?.firstOrNull()?.let { (it as? Map<*, *>)?.get("payment_method_type") as? String } ?: ""
+        val paymentDesc = if (paymentMethodType.contains("debit", ignoreCase = true)) "DEBITO" else "CREDITO"
+
         val pagoItem = hashMapOf<String, Any>(
-            "desc" to "CREDITO",
+            "desc" to paymentDesc,
             "monto" to mntTotal
         )
 
@@ -282,7 +300,7 @@ class BackgroundProcessor(
 
             val sessionData = transactionData["session_data"] as? Map<*, *> ?: emptyMap<Any?, Any?>()
 
-            val dteData = buildDTEData(transactionData, sessionData)
+            val dteData = buildDTEData(transactionData, sessionData, saleMillisOf(transaction))
 
             val requestBody = gson.toJson(dteData).toRequestBody("application/json".toMediaType())
 
@@ -331,32 +349,95 @@ class BackgroundProcessor(
             val firstOrder = orders.firstOrNull() as? Map<*, *> ?: emptyMap<Any?, Any?>()
             val products = firstOrder["products"] as? List<*> ?: emptyList<Any>()
 
+            // Descuento combo: prorrateado por línea como % uniforme sobre el precio individual
+            val dscRcgGlobal = (firstOrder["dsc_rcg_global"] as? Number)?.toDouble() ?: 0.0
+            val totalIndividual = products.sumOf { p ->
+                ((p as? Map<*, *>)?.get("price_subtotal") as? Number)?.toDouble() ?: 0.0
+            }
+            val discountPct = if (dscRcgGlobal > 0.0 && totalIndividual > 0.0)
+                (dscRcgGlobal / totalIndividual) * 100.0
+            else 0.0
+
+            if (discountPct > 0.0) {
+                logger.info("Combo descuento: dscRcgGlobal=$dscRcgGlobal totalIndividual=$totalIndividual discountPct=%.4f%%".format(discountPct))
+            }
+
             val productsForOdoo = products.map { product ->
                 val p = product as Map<*, *>
+                val priceSubtotalIncl = (p["price_subtotal"] as? Number)?.toDouble() ?: 0.0
+                val discountedSubtotalIncl = priceSubtotalIncl * (1.0 - discountPct / 100.0)
                 hashMapOf<String, Any?>(
                     "product_id" to (p["product_id"] as? Number)?.toInt(),
                     "name" to p["name"],
                     "qty" to (p["qty"] as? Number)?.toInt(),
-                    "price_subtotal" to (p["price_subtotal"] as? Number)?.toDouble(),
-                    "price_subtotal_incl" to ((p["price_subtotal"] as? Number)?.toDouble() ?: 0.0) * 1.19
+                    "price_unit" to priceSubtotalIncl / ((p["qty"] as? Number)?.toDouble()?.takeIf { it > 0 } ?: 1.0),
+                    "discount" to discountPct,
+                    "price_subtotal" to discountedSubtotalIncl,
+                    "price_subtotal_incl" to discountedSubtotalIncl
                 )
             }
 
-            val payment = firstOrder["payment"] as? List<*> ?: emptyList<Any>()
+            val rawPayment = firstOrder["payment"] as? List<*> ?: emptyList<Any>()
+            // Calcular monto total de productos para inyectarlo si el payment no lo trae
+            val totalAmount = (transactionData["amount"] as? Number)?.toDouble()
+                ?: products.sumOf { p -> ((p as? Map<*, *>)?.get("price_subtotal") as? Number)?.toDouble() ?: 0.0 }
+
+            val payment = rawPayment.map { pay ->
+                val p = pay as? Map<*, *> ?: return@map pay
+                if (p.containsKey("monto")) {
+                    p
+                } else {
+                    val withMonto = HashMap<Any?, Any?>(p)
+                    withMonto["monto"] = totalAmount
+                    logger.info("Inyectando monto=$totalAmount en payment id=${p["id"]}")
+                    withMonto
+                }
+            }
+
+            val dteForlio = if (isInternalVoucher) (voucherNumber ?: "") else {
+                val folioRaw = dteResponse?.get("folio")
+                if (folioRaw is Number) folioRaw.toLong().toString() else folioRaw?.toString() ?: ""
+            }
+
+            val dteRequestJson = if (!isInternalVoucher) {
+                val sessionDataForDte = transactionData["session_data"] as? Map<*, *> ?: emptyMap<Any?, Any?>()
+                gson.toJson(buildDTEData(transactionData, sessionDataForDte, saleMillisOf(transaction)))
+            } else ""
+
+            val customerComment = (transactionData["orders"] as? List<*>)
+                ?.firstOrNull()?.let { (it as? Map<*, *>)?.get("customer_comment") as? String } ?: ""
+
+            // data_card lleva los campos res_* de la orden en Odoo (tipo de tarjeta,
+            // código de autorización, etc.). Lo completa AutoservicioRoutes con la
+            // respuesta de MercadoPago.
+            val dataCard = firstOrder["data_card"] as? Map<*, *> ?: emptyMap<Any?, Any?>()
 
             val orderItem = hashMapOf<String, Any>(
                 "products" to productsForOdoo,
                 "payment" to payment,
-                "dte_folio" to if (isInternalVoucher) (voucherNumber ?: "") else (dteResponse?.get("folio") ?: ""),
-                "dte_json" to (if (dteResponse != null) gson.toJson(dteResponse) else ""),
+                "data_card" to dataCard,
+                "tipo_dte" to if (isInternalVoucher) 0 else 39,
+                "dte_folio" to dteForlio,
+                "dte_json" to dteRequestJson,
                 "is_internal_voucher" to isInternalVoucher,
-                "internal_voucher_number" to (voucherNumber ?: "")
+                "internal_voucher_number" to (voucherNumber ?: ""),
+                "customer_comment" to customerComment
             )
+            // Hora real de la venta: si la cola sube la orden más tarde, Odoo igual la
+            // registra en su fecha (antes quedaba con la hora de subida).
+            saleMillisOf(transaction)?.let { orderItem["date_order"] = Fechas.utcOdoo(it) }
 
+            val sessionId = (transactionData["session_id"] as? Number)?.toInt() ?: 0
             val odooPayload = hashMapOf<String, Any>(
-                "session_id" to ((transactionData["session_id"] as? Number)?.toInt() ?: 0),
+                "session_id" to sessionId,
                 "orders" to listOf(orderItem)
             )
+
+            logger.info("═══════════════════════════════════════════════════════════")
+            logger.info(" PAYLOAD ODOO - session_id: $sessionId")
+            logger.info(" tipo_dte: ${orderItem["tipo_dte"]} | dte_folio: $dteForlio")
+            logger.info(" is_internal_voucher: $isInternalVoucher | products: ${productsForOdoo.size}")
+            logger.info("═══════════════════════════════════════════════════════════")
 
             val requestBody = gson.toJson(odooPayload).toRequestBody("application/json".toMediaType())
 
@@ -370,6 +451,11 @@ class BackgroundProcessor(
             val responseBody = response.body?.string() ?: "{}"
 
             if (!response.isSuccessful) {
+                // Si Odoo rechaza por folio duplicado, la orden ya está registrada — tratar como éxito
+                if (responseBody.contains("duplicate key") || responseBody.contains("unique constraint")) {
+                    logger.warn("Odoo: folio ya existente (duplicate key) — marcando como completada")
+                    return@withContext mapOf("already_exists" to true)
+                }
                 logger.error("Odoo error: $responseBody")
                 return@withContext null
             }

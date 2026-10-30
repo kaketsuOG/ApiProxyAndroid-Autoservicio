@@ -5,6 +5,7 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 
 class DatabaseManager private constructor(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME, null, DATABASE_VERSION) {
 
@@ -12,7 +13,7 @@ class DatabaseManager private constructor(context: Context) : SQLiteOpenHelper(c
 
     companion object {
         private const val DATABASE_NAME = "api_proxy.db"
-        private const val DATABASE_VERSION = 4
+        private const val DATABASE_VERSION = 5
 
         private const val TABLE_TRANSACTIONS = "transactions"
         private const val TABLE_SESSION_LETTERS = "session_letters"
@@ -24,6 +25,7 @@ class DatabaseManager private constructor(context: Context) : SQLiteOpenHelper(c
         private const val TABLE_CACHED_PRODUCT_SUGGESTIONS = "cached_product_suggestions"
         private const val TABLE_CACHED_PRODUCT_BANNERS = "cached_product_banners"
         private const val TABLE_CACHED_CATEGORY_IMAGES = "cached_category_images"
+        private const val TABLE_CACHED_COMBO_GROUPS = "cached_combo_groups"
 
         @Volatile
         private var INSTANCE: DatabaseManager? = null
@@ -152,6 +154,15 @@ class DatabaseManager private constructor(context: Context) : SQLiteOpenHelper(c
                 cached_at INTEGER NOT NULL
             )
         """)
+
+        db.execSQL("""
+            CREATE TABLE $TABLE_CACHED_COMBO_GROUPS (
+                product_id INTEGER PRIMARY KEY,
+                has_combos INTEGER NOT NULL DEFAULT 0,
+                combo_groups_json TEXT NOT NULL DEFAULT '[]',
+                cached_at INTEGER NOT NULL
+            )
+        """)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -217,6 +228,17 @@ class DatabaseManager private constructor(context: Context) : SQLiteOpenHelper(c
                 CREATE TABLE IF NOT EXISTS $TABLE_CACHED_CATEGORY_IMAGES (
                     category_id INTEGER PRIMARY KEY,
                     image_base64 TEXT NOT NULL,
+                    cached_at INTEGER NOT NULL
+                )
+            """)
+        }
+
+        if (oldVersion < 5) {
+            db.execSQL("""
+                CREATE TABLE IF NOT EXISTS $TABLE_CACHED_COMBO_GROUPS (
+                    product_id INTEGER PRIMARY KEY,
+                    has_combos INTEGER NOT NULL DEFAULT 0,
+                    combo_groups_json TEXT NOT NULL DEFAULT '[]',
                     cached_at INTEGER NOT NULL
                 )
             """)
@@ -860,6 +882,52 @@ class DatabaseManager private constructor(context: Context) : SQLiteOpenHelper(c
         }
     }
 
+    fun deleteCategoryImageCache(categoryId: Int) {
+        try {
+            writableDatabase.delete(TABLE_CACHED_CATEGORY_IMAGES, "category_id = ?", arrayOf(categoryId.toString()))
+        } catch (e: Exception) { /* ignore */ }
+    }
+
+    fun saveComboGroupsCache(productId: Int, hasCombos: Boolean, comboGroups: List<*>): Boolean {
+        return try {
+            val db = writableDatabase
+            val values = ContentValues().apply {
+                put("product_id", productId)
+                put("has_combos", if (hasCombos) 1 else 0)
+                put("combo_groups_json", gson.toJson(comboGroups))
+                put("cached_at", System.currentTimeMillis() / 1000)
+            }
+            db.insertWithOnConflict(TABLE_CACHED_COMBO_GROUPS, null, values, SQLiteDatabase.CONFLICT_REPLACE)
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    fun getComboGroupsFromCache(productId: Int): Map<String, Any>? {
+        return try {
+            val db = readableDatabase
+            val cursor = db.query(
+                TABLE_CACHED_COMBO_GROUPS,
+                arrayOf("has_combos", "combo_groups_json"),
+                "product_id = ?",
+                arrayOf(productId.toString()),
+                null, null, null
+            )
+            cursor.use {
+                if (it.moveToFirst()) {
+                    val hasCombos = it.getInt(0) == 1
+                    val groupsJson = it.getString(1)
+                    val type = object : TypeToken<List<Any>>() {}.type
+                    val groups: List<Any> = gson.fromJson(groupsJson, type) ?: emptyList<Any>()
+                    mapOf("success" to true, "has_combos" to hasCombos, "combo_groups" to groups)
+                } else null
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     fun clearCombosCache(): Boolean {
         return try {
             val db = writableDatabase
@@ -868,6 +936,7 @@ class DatabaseManager private constructor(context: Context) : SQLiteOpenHelper(c
             db.delete(TABLE_CACHED_PRODUCT_SUGGESTIONS, null, null)
             db.delete(TABLE_CACHED_PRODUCT_BANNERS, null, null)
             db.delete(TABLE_CACHED_CATEGORY_IMAGES, null, null)
+            db.delete(TABLE_CACHED_COMBO_GROUPS, null, null)
             true
         } catch (e: Exception) {
             false

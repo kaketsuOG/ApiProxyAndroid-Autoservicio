@@ -1,5 +1,5 @@
 *.iml
-.gradle
+.gradle/
 /local.properties
 /.idea/caches
 /.idea/libraries
@@ -8,8 +8,14 @@
 /.idea/navEditor.xml
 /.idea/assetWizardSettings.xml
 .DS_Store
-/build
+build/
 /captures
 .externalNativeBuild
 .cxx
 local.properties
+
+# Credenciales de firma: el archivo con la clave NO va al repo
+keystore.properties
+
+# APKs firmados (los genera el wizard, no van al repo)
+/app/release/
